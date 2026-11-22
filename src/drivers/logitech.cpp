@@ -14,6 +14,8 @@
 
 #include <algorithm>
 #include <cwctype>
+#include <map>
+#include <mutex>
 #include <optional>
 
 namespace {
@@ -129,46 +131,67 @@ DeviceKind KindFromType(BYTE t) {
     }
 }
 
-// Fills battery fields from whichever battery feature the device has. Returns false if none.
-bool ReadBattery20(Hidpp& h, BYTE idx, USHORT pid, DeviceStatus& s) {
+// Battery features in the order they are tried.
+constexpr USHORT kBatteryFeatures[] = { 0x1004, 0x1000, 0x1001, 0x1F20 };
+
+// Reads the battery through one known feature (`feature` id at feature index `f`). Returns false if the
+// call got no usable answer.
+bool ReadBatteryAt(Hidpp& h, BYTE idx, USHORT pid, USHORT feature, BYTE f, DeviceStatus& s) {
     std::vector<BYTE> p;
-    if (BYTE f = h.FeatureIndex(idx, 0x1004)) {  // UNIFIED_BATTERY: get_status (fn 1)
-        if (h.Call(idx, f, 1, {}, p) && p.size() >= 3) {
-            int soc = p[0], level = p[1], st = p[2];
-            if (soc > 0 && soc <= 100) {
-                s.percent = soc;
-            } else if (level) {
-                s.percent = (level & 8) ? 100 : (level & 4) ? 60 : (level & 2) ? 20 : 5;
-                s.levelText = (level & 8) ? L"Full" : (level & 4) ? L"Good" : (level & 2) ? L"Low" : L"Critical";
+    switch (feature) {
+        case 0x1004:  // UNIFIED_BATTERY: get_status (fn 1)
+            if (h.Call(idx, f, 1, {}, p) && p.size() >= 3) {
+                int soc = p[0], level = p[1], st = p[2];
+                if (soc > 0 && soc <= 100) {
+                    s.percent = soc;
+                } else if (level) {
+                    s.percent = (level & 8) ? 100 : (level & 4) ? 60 : (level & 2) ? 20 : 5;
+                    s.levelText = (level & 8) ? L"Full" : (level & 4) ? L"Good" : (level & 2) ? L"Low" : L"Critical";
+                }
+                s.charging = st == 1 || st == 2 || st == 3;
+                s.full = st == 3;  // charging complete
+                return true;
             }
-            s.charging = st == 1 || st == 2 || st == 3;
-            s.full = st == 3;  // charging complete
-            return true;
-        }
+            return false;
+        case 0x1000:  // BATTERY_STATUS: GetBatteryLevelStatus (fn 0)
+            if (h.Call(idx, f, 0, {}, p) && p.size() >= 3) {
+                int st = p[2];
+                s.charging = st >= 1 && st <= 4;
+                s.full = st == 3;  // charging complete
+                s.percent = p[0] <= 100 ? p[0] : -1;
+                if (s.percent == 0 && st == 3) s.percent = 100;
+                return true;
+            }
+            return false;
+        case 0x1001:  // BATTERY_VOLTAGE: GetBatteryInfo (fn 0)
+            if (h.Call(idx, f, 0, {}, p) && p.size() >= 3) {
+                s.millivolts = (p[0] << 8) | p[1];
+                s.charging = (p[2] & 0x80) != 0;
+                if (s.millivolts) s.percent = LiIonPercent(s.millivolts);
+                return true;
+            }
+            return false;
+        case 0x1F20:  // ADC_MEASUREMENT (headsets)
+            if (h.Call(idx, f, 0, {}, p) && p.size() >= 3) {
+                s.millivolts = (p[0] << 8) | p[1];
+                s.charging = p[2] == 0x03;
+                if (s.millivolts) s.percent = HeadsetPercent(pid, s.millivolts);
+                return true;
+            }
+            return false;
     }
-    if (BYTE f = h.FeatureIndex(idx, 0x1000)) {  // BATTERY_STATUS: GetBatteryLevelStatus (fn 0)
-        if (h.Call(idx, f, 0, {}, p) && p.size() >= 3) {
-            int st = p[2];
-            s.charging = st >= 1 && st <= 4;
-            s.full = st == 3;  // charging complete
-            s.percent = p[0] <= 100 ? p[0] : -1;
-            if (s.percent == 0 && st == 3) s.percent = 100;
-            return true;
-        }
-    }
-    if (BYTE f = h.FeatureIndex(idx, 0x1001)) {  // BATTERY_VOLTAGE: GetBatteryInfo (fn 0)
-        if (h.Call(idx, f, 0, {}, p) && p.size() >= 3) {
-            s.millivolts = (p[0] << 8) | p[1];
-            s.charging = (p[2] & 0x80) != 0;
-            if (s.millivolts) s.percent = LiIonPercent(s.millivolts);
-            return true;
-        }
-    }
-    if (BYTE f = h.FeatureIndex(idx, 0x1F20)) {  // ADC_MEASUREMENT (headsets)
-        if (h.Call(idx, f, 0, {}, p) && p.size() >= 3) {
-            s.millivolts = (p[0] << 8) | p[1];
-            s.charging = p[2] == 0x03;
-            if (s.millivolts) s.percent = HeadsetPercent(pid, s.millivolts);
+    return false;
+}
+
+// Fills battery fields from whichever battery feature the device has. Returns false if none; on success
+// `feature` and `index` say which feature answered, so later polls can call it directly.
+bool ReadBattery20(Hidpp& h, BYTE idx, USHORT pid, DeviceStatus& s, USHORT& feature, BYTE& index) {
+    for (USHORT id : kBatteryFeatures) {
+        BYTE f = h.FeatureIndex(idx, id);
+        if (!f) continue;
+        if (ReadBatteryAt(h, idx, pid, id, f, s)) {
+            feature = id;
+            index = f;
             return true;
         }
     }
@@ -252,10 +275,50 @@ std::wstring PhysicalKey(const HidColl& c) {
     return hw + L"#" + inst;
 }
 
+// What a HID++ 2.0 device reports once and keeps: its name, kind, unit id and the index of its battery
+// feature. Reading them again costs about seven extra radio round trips per poll (root feature lookups,
+// the name in chunks, the device type and info), each of which wakes the mouse's radio. With them cached a
+// poll is a ping and one battery call. An entry is re-read in full every kInfoRefreshMs, and dropped as
+// soon as a cached battery call fails (another device paired to the slot, a firmware update, ...).
+struct CachedInfo {
+    std::wstring name;
+    DeviceKind kind = DeviceKind::Other;
+    std::wstring unit;
+    USHORT batteryFeature = 0;
+    BYTE batteryIndex = 0;
+    ULONGLONG readAt = 0;
+};
+constexpr ULONGLONG kInfoRefreshMs = 30ULL * 60 * 1000;
+
+std::mutex g_infoMutex;
+std::map<std::wstring, CachedInfo> g_info;  // by receiver/link and device index
+
+std::optional<CachedInfo> LookupInfo(const std::wstring& key) {
+    std::lock_guard<std::mutex> lock(g_infoMutex);
+    auto it = g_info.find(key);
+    if (it == g_info.end() || GetTickCount64() - it->second.readAt >= kInfoRefreshMs) return std::nullopt;
+    return it->second;
+}
+void StoreInfo(const std::wstring& key, CachedInfo info) {
+    std::lock_guard<std::mutex> lock(g_infoMutex);
+    if (info.batteryFeature) g_info[key] = std::move(info);
+    else g_info.erase(key);
+}
+
+}  // namespace
+
+void ResetLogitechInfoCache() {
+    std::lock_guard<std::mutex> lock(g_infoMutex);
+    g_info.clear();
+}
+
+namespace {
+
 // Polls one physical device (receiver, cable or Bluetooth link) given its HID++ collections.
 // `suffix` keeps the fallback keys of identical receivers apart. Returns true if it reported a device.
 bool PollLogitechDevice(PollContext& ctx, USHORT pid, const std::vector<const HidColl*>& shorts,
-                        const std::vector<const HidColl*>& longs, const std::wstring& suffix) {
+                        const std::vector<const HidColl*>& longs, const std::wstring& suffix,
+                        const std::wstring& link) {
     if (shorts.empty() && longs.empty()) return false;
     Hidpp h;
     if (!h.Open(shorts.empty() ? nullptr : shorts[0], longs.empty() ? nullptr : longs[0])) return false;
@@ -299,9 +362,33 @@ bool PollLogitechDevice(PollContext& ctx, USHORT pid, const std::vector<const Hi
         int r = h.Request(idx, 0x00, 0x10 | kSwId, { 0, 0, 0x5A }, p, err, false, pingTimeoutMs);
         bool found = false;
         if (r == 1 && p.size() >= 3 && p[0] >= 2) {
-            ReadNameAndType20(h, idx, s);
-            found = ReadBattery20(h, idx, pid, s);
-            std::wstring unit = found ? ReadUnitId20(h, idx) : L"";
+            const std::wstring infoKey = Hex4(pid) + suffix + L"|" + link + L"|" + std::to_wstring(idx);
+            std::wstring unit;
+            if (auto info = LookupInfo(infoKey)) {
+                found = ReadBatteryAt(h, idx, pid, info->batteryFeature, info->batteryIndex, s);
+                if (found) {
+                    s.name = info->name.empty() ? s.name : info->name;
+                    if (info->kind != DeviceKind::Other) s.kind = info->kind;
+                    unit = info->unit;
+                } else {
+                    StoreInfo(infoKey, {});  // stale: read everything again below
+                }
+            }
+            if (!found) {
+                const std::wstring defaultName = s.name;
+                const DeviceKind defaultKind = s.kind;
+                ReadNameAndType20(h, idx, s);
+                CachedInfo info;
+                found = ReadBattery20(h, idx, pid, s, info.batteryFeature, info.batteryIndex);
+                unit = found ? ReadUnitId20(h, idx) : L"";
+                if (found) {
+                    info.name = s.name != defaultName ? s.name : L"";
+                    info.kind = s.kind != defaultKind ? s.kind : DeviceKind::Other;
+                    info.unit = unit;
+                    info.readAt = GetTickCount64();
+                    StoreInfo(infoKey, std::move(info));
+                }
+            }
             if (!unit.empty()) {
                 s.key = L"logi:unit:" + unit;
                 // Unplugging the cable hands a receiver device back to its receiver; keep the
@@ -353,7 +440,7 @@ void PollLogitech(PollContext& ctx) {
             for (const HidColl* c : allLongs) if (PhysicalKey(*c) == groups[g]) longs.push_back(c);
             // Keys of the first device stay as they were; a second identical receiver gets "#2", ...
             std::wstring suffix = g ? L"#" + std::to_wstring(g + 1) : L"";
-            if (PollLogitechDevice(ctx, pid, shorts, longs, suffix)) any = true;
+            if (PollLogitechDevice(ctx, pid, shorts, longs, suffix, groups[g])) any = true;
         }
         if (any) ctx.Claim(vid, pid);
     }

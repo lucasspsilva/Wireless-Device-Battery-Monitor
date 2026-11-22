@@ -1908,6 +1908,8 @@ DWORD WINAPI Worker(LPVOID) {
         ReleaseSRWLockExclusive(&g_monitorLock);
         if (request == refresh_policy::Mode::Resume) monitor.BeginResume(std::move(keys));
         else if (request == refresh_policy::Mode::Arrival) monitor.BeginArrival(std::move(keys));
+        // A device came, went or the PC woke up: read Logitech device details again rather than trust the cache.
+        if (request != refresh_policy::Mode::Idle) ResetLogitechInfoCache();
 
         auto* v = new std::vector<DeviceStatus>(g_demo ? DemoDevices() : PollAllDevices());
         DWORD delay = monitor.DelayAfterPoll(*v, g_pollIntervalMs);
